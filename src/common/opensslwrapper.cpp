@@ -83,6 +83,8 @@ extern "C" int pthread_atfork(void (*prepare)(void), void (*parent)(void), void(
 //-----------------------------------------------------------------------------
 void COpenSSLWrapper::Initialize()
 {
+	int iStatus;
+
 	// If this is the first instance then we need to do some one time initialization of the OpenSSL library
 	if ( m_nInstances++ == 0 )
 	{
@@ -122,7 +124,7 @@ void COpenSSLWrapper::Initialize()
 		pthread_atfork( NULL, NULL, []{ RAND_poll(); } );
 #endif
 
-		int iStatus = RAND_status();
+		iStatus = RAND_status();
 		AssertMsg( iStatus == 1, "OpenSSL random number system reports not enough entropy" );
 	}
 }

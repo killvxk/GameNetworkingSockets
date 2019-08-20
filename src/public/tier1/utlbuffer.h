@@ -15,7 +15,6 @@
 #endif
 
 #include "tier1/utlmemory.h"
-#include "tier0/validator.h"
 #include <stdarg.h>
 //SDR_PUBLIC #include "tier1/utlstring.h"
 
@@ -332,15 +331,6 @@ public:
 	// Securely erases buffer
 	void SecureZero() { SecureZeroMemory( m_Memory.Base(), m_Memory.Count() ); }
 
-#ifdef DBGFLAG_VALIDATE
-	void Validate( CValidator &validator, const char *pchName )
-	{
-		validator.Push( "CUtlBuffer", this, pchName );
-		m_Memory.Validate( validator, "m_Memory" );
-		validator.Pop();
-	}
-#endif
-
 protected:
 	// error flags
 	enum
@@ -455,6 +445,11 @@ inline void *CUtlBuffer::ReservePut( int nBytes )
 //-----------------------------------------------------------------------------
 // Unserialization
 //-----------------------------------------------------------------------------
+#if defined(__arm__) || defined(__arm64__)
+#define COPY_TYPE( _type, _val ) V_memcpy( &_val, PeekGet(), sizeof( _type ) )
+#else
+#define COPY_TYPE( _type, _val ) _val = *(_type *)PeekGet()
+#endif
 #define GET_TYPE( _type, _val, _fmt )			\
 	if ( !IsText() )							\
 	{											\
@@ -500,7 +495,7 @@ inline void *CUtlBuffer::ReservePut( int nBytes )
 			}									\
 			else								\
 			{									\
-				_val = *(_type *)PeekGet();		\
+				COPY_TYPE( _type, _val );		\
 			}									\
 			m_Get += sizeof(_type);				\
 		}										\
@@ -801,6 +796,32 @@ inline void	CUtlBuffer::CopyBuffer( const void *pubData, int cubData )
 	}
 }
 
+
+/// CUtlBuffer that will wipe upon destruction
+//
+/// WARNING: This is only intended for simple use cases where the caller
+/// can easily pre-allocate.  For example, it won't wipe if the buffer needs
+/// to be relocated as a result of realloc.  Or if you pas it to a function
+/// via a CUtlBuffer&, and CUtlBuffer::Purge is invoked directly.  Etc.
+class CAutoWipeBuffer : public CUtlBuffer
+{
+public:
+	CAutoWipeBuffer() {}
+	explicit CAutoWipeBuffer( int cbInit ) : CUtlBuffer( 0, cbInit, 0 ) {}
+	~CAutoWipeBuffer() { Purge(); }
+
+	void Clear()
+	{
+		SecureZeroMemory( Base(), SizeAllocated() );
+		CUtlBuffer::Clear();
+	}
+
+	void Purge()
+	{
+		Clear();
+		CUtlBuffer::Purge();
+	}
+};
 
 #endif // UTLBUFFER_H
 

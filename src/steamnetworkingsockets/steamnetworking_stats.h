@@ -10,7 +10,7 @@
 #pragma once
 #endif
 
-#include <steamnetworkingsockets/steamnetworkingtypes.h>
+#include <steam/steamnetworkingtypes.h>
 
 #pragma pack(push)
 #pragma pack(8)
@@ -60,6 +60,111 @@ struct SteamDatagramLinkInstantaneousStats
 	void Clear();
 };
 
+/// Counts of ping times by bucket
+struct PingHistogram
+{
+	int m_n25, m_n50, m_n75, m_n100, m_n125, m_n150, m_n200, m_n300, m_nMax;
+
+	void Reset() { memset( this, 0, sizeof(*this) ); }
+
+	void AddSample( int nPingMS )
+	{
+
+		// Update histogram using hand-rolled sort-of-binary-search, optimized
+		// for the expectation that most pings will be reasonable
+		if ( nPingMS <= 100 )
+		{
+			if ( nPingMS <= 50 )
+			{
+				if ( nPingMS <= 25 )
+					++m_n25;
+				else
+					++m_n50;
+			}
+			else
+			{
+				if ( nPingMS <= 75 )
+					++m_n75;
+				else
+					++m_n100;
+			}
+		}
+		else
+		{
+			if ( nPingMS <= 150 )
+			{
+				if ( nPingMS <= 125 )
+					++m_n125;
+				else
+					++m_n150;
+			}
+			else
+			{
+				if ( nPingMS <= 200 )
+					++m_n200;
+				else if ( nPingMS <= 300 )
+					++m_n300;
+				else
+					++m_nMax;
+			}
+		}
+	}
+
+	inline int TotalCount() const
+	{
+		return m_n25 + m_n50 + m_n75 + m_n100 + m_n125 + m_n150 + m_n200 + m_n300 + m_nMax;
+	}
+};
+
+/// Count of quality measurement intervals by bucket
+struct QualityHistogram
+{
+	int m_n100, m_n99, m_n97, m_n95, m_n90, m_n75, m_n50, m_n1, m_nDead;
+
+	void Reset() { memset( this, 0, sizeof(*this) ); }
+
+	inline int TotalCount() const
+	{
+		return m_n100 + m_n99 + m_n97 + m_n95 + m_n90 + m_n75 + m_n50 + m_n1 + m_nDead;
+	}
+};
+
+/// Counts of jitter values by bucket
+struct JitterHistogram
+{
+	void Reset() { memset( this, 0, sizeof(*this) ); }
+
+	int m_nNegligible; // <1ms
+	int m_n1; // 1--2ms
+	int m_n2; // 2--5ms
+	int m_n5; // 5--10ms
+	int m_n10; // 10--20ms
+	int m_n20; // 20ms or more
+
+	void AddSample( SteamNetworkingMicroseconds usecJitter )
+	{
+
+		// Add to histogram
+		if ( usecJitter < 1000 )
+			++m_nNegligible;
+		else if ( usecJitter < 2000 )
+			++m_n1;
+		else if ( usecJitter < 5000 )
+			++m_n2;
+		else if ( usecJitter < 10000 )
+			++m_n5;
+		else if ( usecJitter < 20000 )
+			++m_n10;
+		else
+			++m_n20;
+	}
+
+	inline int TotalCount() const
+	{
+		return m_nNegligible + m_n1 + m_n2 + m_n5 + m_n10 + m_n20;
+	}
+};
+
 /// Stats for the lifetime of a connection.
 /// Should match CMsgSteamDatagramLinkLifetimeStats
 struct SteamDatagramLinkLifetimeStats
@@ -87,30 +192,8 @@ struct SteamDatagramLinkLifetimeStats
 	int64 m_nMessagesRecvReliable;
 	int64 m_nMessagesRecvUnreliable;
 
-	//
 	// Ping distribution
-	//
-	int m_nPingHistogram25; // 0..25
-	int m_nPingHistogram50; // 26..50
-	int m_nPingHistogram75; // 51..75
-	int m_nPingHistogram100; // etc
-	int m_nPingHistogram125;
-	int m_nPingHistogram150;
-	int m_nPingHistogram200;
-	int m_nPingHistogram300;
-	int m_nPingHistogramMax; // >300
-	inline int PingHistogramTotalCount() const
-	{
-		return m_nPingHistogram25
-			+ m_nPingHistogram50
-			+ m_nPingHistogram75
-			+ m_nPingHistogram100
-			+ m_nPingHistogram125
-			+ m_nPingHistogram150
-			+ m_nPingHistogram200
-			+ m_nPingHistogram300
-			+ m_nPingHistogramMax;
-	}
+	PingHistogram m_pingHistogram;
 
 	// Distribution.
 	// NOTE: Some of these might be -1 if we didn't have enough data to make a meaningful estimate!
@@ -126,27 +209,7 @@ struct SteamDatagramLinkLifetimeStats
 	//
 	// Connection quality distribution
 	//
-	int m_nQualityHistogram100; // This means everything was perfect.  If we delivered over 100 packets in the interval and were less than perfect, but greater than 99.5%, we will use 99% instead.
-	int m_nQualityHistogram99; // 99%+
-	int m_nQualityHistogram97;
-	int m_nQualityHistogram95;
-	int m_nQualityHistogram90;
-	int m_nQualityHistogram75;
-	int m_nQualityHistogram50;
-	int m_nQualityHistogram1;
-	int m_nQualityHistogramDead; // we received nothing during the interval; it looks like the connection dropped
-	inline int QualityHistogramTotalCount() const
-	{
-		return m_nQualityHistogram100
-			+ m_nQualityHistogram99
-			+ m_nQualityHistogram97
-			+ m_nQualityHistogram95
-			+ m_nQualityHistogram90
-			+ m_nQualityHistogram75
-			+ m_nQualityHistogram50
-			+ m_nQualityHistogram1
-			+ m_nQualityHistogramDead;
-	}
+	QualityHistogram m_qualityHistogram;
 
 	// Distribution.  Some might be -1, see above for why.
 	short m_nQualityNtile2nd; // 2% of measurement intervals had quality <= N%
@@ -155,21 +218,7 @@ struct SteamDatagramLinkLifetimeStats
 	short m_nQualityNtile50th; // 50% of measurement intervals had quality <= N%
 
 	// Jitter histogram
-	int m_nJitterHistogramNegligible;
-	int m_nJitterHistogram1;
-	int m_nJitterHistogram2;
-	int m_nJitterHistogram5;
-	int m_nJitterHistogram10;
-	int m_nJitterHistogram20;
-	inline int JitterHistogramTotalCount() const
-	{
-		return m_nJitterHistogramNegligible
-			+ m_nJitterHistogram1
-			+ m_nJitterHistogram2
-			+ m_nJitterHistogram5
-			+ m_nJitterHistogram10
-			+ m_nJitterHistogram20;
-	}
+	JitterHistogram m_jitterHistogram;
 
 	//
 	// Connection transmit speed histogram
@@ -269,18 +318,6 @@ struct SteamDatagramLinkStats
 	void Clear();
 };
 
-/// Status of a particular network resource
-enum ESteamDatagramAvailability
-{
-	k_ESteamDatagramAvailability_CannotTry = -3,		// A dependent resource is missing, so this service is unavailable.  (E.g. we cannot talk to routers because Internet is down or we don't have the network config.)
-	k_ESteamDatagramAvailability_Failed = -2,			// We have tried for enough time that we would expect to have been successful by now.  We have never been successful
-	k_ESteamDatagramAvailability_Previously = -1,		// We tried and were successful at one time, but now it looks like we have a problem
-	k_ESteamDatagramAvailability_Unknown = 0,			// Unknown, or not applicable in this context
-	k_ESteamDatagramAvailability_NeverTried = 1,		// We don't know because we haven't ever checked
-	k_ESteamDatagramAvailability_Attempting = 2,		// We're trying now, but are not yet successful.  This is not an error, but it's not success, either.
-	k_ESteamDatagramAvailability_Current = 3,			// Resource is online.
-};
-
 /// Describe detailed state of current connection
 struct SteamNetworkingDetailedConnectionStatus
 {
@@ -288,7 +325,7 @@ struct SteamNetworkingDetailedConnectionStatus
 	SteamNetConnectionInfo_t m_info;
 
 	/// Do we have a valid network configuration?  We cannot do anything without this.
-	ESteamDatagramAvailability m_eAvailNetworkConfig;
+	ESteamNetworkingAvailability m_eAvailNetworkConfig;
 
 //		/// Does it look like we have a connection to the Internet at all?
 //		EAvailability m_eAvailInternet;
@@ -296,10 +333,10 @@ struct SteamNetworkingDetailedConnectionStatus
 	/// Successful communication with a box on the routing network.
 	/// This will be marked as failed if there is a general internet
 	/// connection.
-	ESteamDatagramAvailability m_eAvailAnyRouterCommunication;
+	ESteamNetworkingAvailability m_eAvailAnyRouterCommunication;
 
 	/// End-to-end communication with the remote host.
-	//ESteamDatagramAvailability m_eAvailEndToEnd;
+	//ESteamNetworkingAvailability m_eAvailEndToEnd;
 
 	/// Stats for end-to-end link to the gameserver
 	SteamDatagramLinkStats m_statsEndToEnd;

@@ -1,9 +1,39 @@
-find_package(Protobuf REQUIRED)
-find_package(OpenSSL REQUIRED)
-find_package(Threads REQUIRED)
-
 include(CheckCCompilerFlag)
 include(CheckCXXCompilerFlag)
+include(CheckSymbolExists)
+include(CMakePushCheckState)
+
+find_package(Protobuf REQUIRED)
+if (NOT USE_BCRYPT)
+	find_package(OpenSSL REQUIRED)
+
+	# Ensure the OpenSSL version is recent enough. We need a bunch of EVP
+	# functionality.
+	cmake_push_check_state()
+	set(CMAKE_REQUIRED_LIBRARIES OpenSSL::Crypto)
+	check_symbol_exists(EVP_MD_CTX_free openssl/evp.h OPENSSL_NEW_ENOUGH)
+	if (NOT OPENSSL_NEW_ENOUGH)
+		message(FATAL_ERROR "Your OpenSSL version appears to be too old. Check that you're using OpenSSL 1.1.0 or later.")
+	endif()
+	cmake_pop_check_state()
+	cmake_push_check_state()
+	set(CMAKE_REQUIRED_LIBRARIES OpenSSL::Crypto)
+	check_symbol_exists(EVP_PKEY_get_raw_public_key openssl/evp.h OPENSSL_HAS_25519_RAW)
+	cmake_pop_check_state()
+endif()
+find_package(Threads REQUIRED)
+
+if(USE_BCRYPT)
+	set(GNS_CRYPTO_AES_BCRYPT ON)
+	set(GNS_CRYPTO_25519_REF ON)
+else()
+	set(GNS_CRYPTO_AES_OPENSSL ON)
+	if(OPENSSL_HAS_25519_RAW)
+		set(GNS_CRYPTO_25519_OPENSSL ON)
+	else()
+		set(GNS_CRYPTO_25519_REF ON)
+	endif()
+endif()
 
 set(GNS_PROTOS
 	"common/steamnetworkingsockets_messages_certs.proto"
@@ -12,15 +42,13 @@ set(GNS_PROTOS
 )
 
 set(GNS_SRCS
-	"external/curve25519-donna/curve25519.c"
-	"external/curve25519-donna/curve25519_VALVE_sse2.c"
-	"external/ed25519-donna/ed25519_VALVE.c"
-	"external/ed25519-donna/ed25519_VALVE_sse2.c"
-	"common/crypto.cpp"
-	"common/opensslwrapper.cpp"
+	"common/crypto_bcrypt.cpp"
+	"common/crypto_openssl.cpp"
+	"common/crypto_25519_donna.cpp"
+	"common/crypto_25519_openssl.cpp"
+	"common/crypto_textencode.cpp"
+	"common/keypair.cpp"
 	"common/steamid.cpp"
-	"public/minbase/minbase_common_errors.cpp"
-	"steamnetworkingsockets/certtool/steamnetworkingsockets_certtool.cpp"
 	"steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_flat.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_connections.cpp"
@@ -28,15 +56,40 @@ set(GNS_SRCS
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_snp.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_udp.cpp"
 	"steamnetworkingsockets/steamnetworkingsockets_certs.cpp"
+	"steamnetworkingsockets/steamnetworkingsockets_certstore.cpp"
 	"steamnetworkingsockets/steamnetworkingsockets_shared.cpp"
-	"tier0/cpu.cpp"
 	"tier0/dbg.cpp"
 	"tier0/platformtime.cpp"
+	"tier1/bitstring.cpp"
 	"tier1/netadr.cpp"
 	"tier1/utlbuffer.cpp"
 	"tier1/utlmemory.cpp"
+	"tier1/ipv6text.c"
 	"vstdlib/strtools.cpp"
 )
+
+if(GNS_CRYPTO_25519_OPENSSL)
+	# No additional sources needed!
+elseif(GNS_CRYPTO_25519_REF)
+	set(GNS_SRCS ${GNS_SRCS}
+		"external/curve25519-donna/curve25519.c"
+		"external/curve25519-donna/curve25519_VALVE_sse2.c"
+		"external/ed25519-donna/ed25519_VALVE.c"
+		"external/ed25519-donna/ed25519_VALVE_sse2.c"
+	)
+else()
+	message(FATAL_ERROR "Unknown ed25519/curve25519 implementation")
+endif()
+
+if(GNS_CRYPTO_AES_OPENSSL)
+	set(GNS_SRCS ${GNS_SRCS}
+		"common/opensslwrapper.cpp"
+	)
+elseif(GNS_CRYPTO_AES_BCRYPT)
+	# No additional sources
+else()
+	message(FATAL_ERROR "Unknown AES implementation")
+endif()
 
 set(C99_FEATURES
 	c_restrict
@@ -51,12 +104,18 @@ set(GNS_COMMON_FLAGS
 	-fno-strict-aliasing
 	-Wall
 	#-Wextra
-	#-pedantic
 	-Wno-unknown-pragmas
 	-Wno-sign-compare
 	-Wno-unused-local-typedef
 	-Wno-unused-const-variable
+	-Wno-nested-anon-types
 )
+
+if(WERROR)
+	set(GNS_COMMON_FLAGS
+		${GNS_COMMON_FLAGS}
+		-Werror)
+endif()
 
 set(GNS_C_FLAGS
 	-Wstrict-prototypes
@@ -66,9 +125,16 @@ set(GNS_CXX_FLAGS
 	-fvisibility-inlines-hidden
 	-Wno-reorder
 	-Wno-non-virtual-dtor
-	-fno-rtti
+	-Wno-zero-as-null-pointer-constant
 	-fno-exceptions
 )
+
+if(NOT SANITIZE_UNDEFINED)
+	set(GNS_CXX_FLAGS
+		${GNS_CXX_FLAGS}
+		-fno-rtti
+	)
+endif()
 
 protobuf_generate_cpp(GNS_PROTO_SRCS GNS_PROTO_HDRS ${GNS_PROTOS})
 
@@ -79,35 +145,44 @@ macro(gamenetworkingsockets_common GNS_TARGET)
 
 	target_include_directories(${GNS_TARGET} PUBLIC
 		"../include"
+		${CMAKE_CURRENT_BINARY_DIR}
 	)
 
 	target_include_directories(${GNS_TARGET} PRIVATE
 		"common"
 		"public"
-		${CMAKE_CURRENT_BINARY_DIR}
 
 		# Only necessary if we're not using protobuf::libprotobuf
 		# But that's not supported until CMake 3.9
 		${Protobuf_INCLUDE_DIRS}
 	)
 
-	target_link_libraries(${GNS_TARGET} PRIVATE
+	target_link_libraries(${GNS_TARGET} PUBLIC
 		# protobuf::libprotobuf
 		${PROTOBUF_LIBRARIES}
-		OpenSSL::Crypto
 		Threads::Threads
 	)
 
+	if(NOT USE_BCRYPT)
+		target_link_libraries(${GNS_TARGET} PUBLIC
+			OpenSSL::Crypto
+		)
+	endif()
+
 	target_compile_definitions(${GNS_TARGET} PRIVATE
-		STEAMDATAGRAMLIB_FOREXPORT
-		STATIC_TIER0
-		# needed for ed25519-donna
-		ENABLE_CRYPTO_25519
-		HAVE_OPENSSL
+		STEAMNETWORKINGSOCKETS_FOREXPORT
 		ENABLE_OPENSSLCONNECTION
 		CRYPTO_DISABLE_ENCRYPT_WITH_PASSWORD
 		GOOGLE_PROTOBUF_NO_RTTI
 	)
+
+	if(USE_BCRYPT)
+		target_compile_definitions(${GNS_TARGET} PRIVATE ED25519_HASH_BCRYPT)
+	endif()
+
+	if(SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+		target_compile_definitions(${GNS_TARGET} PRIVATE ED25519_NO_INLINE_ASM)
+	endif()
 
 	## Needs CMake 3.8, then we could get rid of the workaround below it.
 	#target_compile_features(${GNS_TARGET} PUBLIC c_std_99 cxx_std_11)
@@ -116,7 +191,7 @@ macro(gamenetworkingsockets_common GNS_TARGET)
 	endif()
 
 	if(CMAKE_CXX_COMPILER_ID MATCHES "GNU"
-	OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+			OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 		foreach(FLAG ${GNS_COMMON_FLAGS} ${GNS_C_FLAGS})
 			string(MAKE_C_IDENTIFIER ${FLAG} FLAG_ID)
 			check_c_compiler_flag(${FLAG} ${FLAG_ID}_TEST)
@@ -131,25 +206,19 @@ macro(gamenetworkingsockets_common GNS_TARGET)
 			check_cxx_compiler_flag(${FLAG} ${FLAG_ID}_TEST)
 			if(${FLAG_ID}_TEST)
 				target_compile_options(${GNS_TARGET} PRIVATE
-				$<$<COMPILE_LANGUAGE:CXX>:${FLAG}>
-			)
-		endif()
+					$<$<COMPILE_LANGUAGE:CXX>:${FLAG}>
+					)
+			endif()
 		endforeach()
 	endif()
 
 	if(CMAKE_SYSTEM_NAME MATCHES Linux)
-		target_compile_definitions(${GNS_TARGET} PRIVATE POSIX LINUX)
+		target_compile_definitions(${GNS_TARGET} PUBLIC POSIX LINUX)
 	elseif(CMAKE_SYSTEM_NAME MATCHES Darwin)
-		target_compile_definitions(${GNS_TARGET} PRIVATE POSIX OSX)
+		target_compile_definitions(${GNS_TARGET} PUBLIC POSIX OSX)
 	elseif(CMAKE_SYSTEM_NAME MATCHES Windows)
-		target_compile_definitions(${GNS_TARGET} PRIVATE
-			WIN32
-		)
+		target_compile_definitions(${GNS_TARGET} PUBLIC WIN32)
 		if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
-			target_compile_definitions(${GNS_TARGET} PRIVATE
-				_CRT_SECURE_NO_WARNINGS
-				_ITERATOR_DEBUG_LEVEL=0
-			)
 			if(NOT Protobuf_USE_STATIC_LIBS)
 				target_compile_definitions(${GNS_TARGET} PRIVATE
 					PROTOBUF_USE_DLLS)
@@ -158,22 +227,30 @@ macro(gamenetworkingsockets_common GNS_TARGET)
 			target_compile_options(${GNS_TARGET} PRIVATE
 				/EHs-c-   # Disable C++ exceptions
 				/GR-      # Disable RTTI
+
+				# Below are warnings we can't fix and don't want to see (mostly from protobuf, some from MSVC standard library)
 				/wd4146   # include/google/protobuf/wire_format_lite.h(863): warning C4146: unary minus operator applied to unsigned type, result still unsigned
-			)
+				/wd4530   # .../xlocale(319): warning C4530: C++ exception handler used, but unwind semantics are not enabled. Specify /EHsc
+				/wd4244   # google/protobuf/wire_format_lite.h(935): warning C4244: 'argument': conversion from 'google::protobuf::uint64' to 'google::protobuf::uint32', possible loss of data
+				/wd4251   # 'google::protobuf::io::CodedOutputStream::default_serialization_deterministic_': struct 'std::atomic<bool>' needs to have dll-interface to be used by clients of class 
+				)
 			if(NOT TARGET_TYPE STREQUAL STATIC_LIBRARY)
 				target_compile_options(${GNS_TARGET} PRIVATE
 					/GL       # Enable link-time code generation
-				)
+					)
 				set_target_properties(${GNS_TARGET} PROPERTIES LINK_FLAGS "/LTCG /SUBSYSTEM:WINDOWS")
 			endif()
 		else()
 			target_compile_definitions(${GNS_TARGET} PRIVATE
 				__STDC_FORMAT_MACROS=1
 				__USE_MINGW_ANSI_STDIO=0
-			)
+				)
 			target_compile_options(${GNS_TARGET} PRIVATE -fno-stack-protector)
 		endif()
-		target_link_libraries(${GNS_TARGET} PRIVATE ws2_32)
+		target_link_libraries(${GNS_TARGET} PUBLIC ws2_32 crypt32)
+		if(USE_BCRYPT)
+			target_link_libraries(${GNS_TARGET} PUBLIC bcrypt)
+		endif()
 	else()
 		message(FATAL_ERROR "Could not identify your target operating system")
 	endif()
@@ -183,20 +260,27 @@ macro(gamenetworkingsockets_common GNS_TARGET)
 	endif()
 
 	if(CMAKE_CXX_COMPILER_ID MATCHES "GNU"
-	OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-		target_compile_definitions(${GNS_TARGET} PRIVATE GNUC GNU_COMPILER)
+			OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+		target_compile_definitions(${GNS_TARGET} PUBLIC GNUC GNU_COMPILER)
 	endif()
 
 	set_target_properties(${GNS_TARGET} PROPERTIES
 		CXX_STANDARD 11
-	)
+		)
 
 endmacro()
 
 add_library(GameNetworkingSockets SHARED "")
 add_library(GameNetworkingSockets::shared ALIAS GameNetworkingSockets)
 gamenetworkingsockets_common(GameNetworkingSockets)
+add_sanitizers(GameNetworkingSockets)
 
 add_library(GameNetworkingSockets_s STATIC "")
 add_library(GameNetworkingSockets::static ALIAS GameNetworkingSockets_s)
+target_compile_definitions(GameNetworkingSockets_s INTERFACE STEAMNETWORKINGSOCKETS_STATIC_LINK)
 gamenetworkingsockets_common(GameNetworkingSockets_s)
+add_sanitizers(GameNetworkingSockets_s)
+
+configure_file(gnsconfig.h.in.cmake gnsconfig.h)
+
+# vim: set ts=4 sts=4 sw=4 noet:

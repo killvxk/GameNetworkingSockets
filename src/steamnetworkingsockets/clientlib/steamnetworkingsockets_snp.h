@@ -13,33 +13,10 @@ namespace SteamNetworkingSocketsLib {
 
 class CSteamNetworkConnectionBase;
 
-//
-// Constants
-//
-const int TFRC_NDUPACK = 3; // Number of packets to wait after a missing packet (RFC 4342, 6.1)
-
-const int NINTERVAL = 8; // Number of loss intervals (RFC 4342, 8.6.1). 
-const int LIH_SIZE = (NINTERVAL + 1); // The history size is one more than NINTERVAL, 
-										 // since the `open' interval I_0 is always 
-										 // stored as the first entry.
-const SteamNetworkingMicroseconds kSNPInitialNagle = 100000; // 100ms default nagle, the nagle timeout 
-															 // will get changed to 2*R once we have rtt
-
-// Linux uses 200ms RTO minimum, let's use that
-const SteamNetworkingMicroseconds TCP_RTO_MIN = k_nMillion / 5;
-
-// Note this shouldn't be more then TCP_RTO_MIN since that's used for re-transmission and feedback pump
-const SteamNetworkingMicroseconds kSNPMinThink = TCP_RTO_MIN; 
-
-const SteamNetworkingMicroseconds TFRC_INITIAL_TIMEOUT = 2 * k_nMillion;
-
-const int k_nSteamDatagramGlobalMinRate = 5000;
-const int k_nSteamDatagramGlobalMaxRate = 4*k_nMillion;
-
-const int k_nBurstMultiplier = 4; // how much we should allow for burst, TFRC defaults to 2 but we need more
-
+/// Maximum number of packets we will send in one Think() call.
 const int k_nMaxPacketsPerThink = 16;
 
+/// Max number of tokens we are allowed to store up in reserve, for a burst.
 const float k_flSendRateBurstOverageAllowance = k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend;
 
 struct SNPRange_t
@@ -142,6 +119,14 @@ struct SSNPSendMessageList
 		return false;
 	}
 
+	/// Delete all elements.  This should only be called if you own the messages!
+	void delete_all()
+	{
+		while ( m_pFirst )
+			delete pop_front();
+		Assert( m_pLast == nullptr );
+	}
+
 	/// Unlink the message at the head, if any and return it.
 	/// Unlike STL pop_front, this will return nullptr if the
 	/// list is empty
@@ -193,24 +178,17 @@ struct SSNPSendMessageList
 
 struct SSNPSenderState
 {
+	SSNPSenderState();
+	~SSNPSenderState() {
+		Shutdown();
+	}
+	void Shutdown();
 
-	// Sender TFRC control values and timers
-
-	// Current sending rate in bytes per second, RFC 3448 4.2 states default
-	// is one packet per second, but that is insane and we're not doing that.
-	// In most cases we will set a default based on initial ping, so this is
-	// only rarely used.
+	/// Current sending rate in bytes per second, RFC 3448 4.2 states default
+	/// is one packet per second, but that is insane and we're not doing that.
+	/// In most cases we will set a default based on initial ping, so this is
+	/// only rarely used.
 	int m_n_x = 32*1024;
-
-	int m_n_minRate = 0; // Minimum send rate, if 0 defaults to using the global config setting
-	int m_n_maxRate = 0; // Maximum send rate, if 0 defaults to using the global config setting
-	//int m_n_x_recv = 0; // Received rate transmitted by receiver
-	int m_n_x_calc = 0;	// Calculated rate in bytes per second
-	//uint32 m_un_p = 0;		// Current loss event rate (0-1) scaled to 0-UINT_MAX
-	int m_n_tx_s = k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend;	// Average packet size in bytes
-	//SteamNetworkingMicroseconds m_usec_rto = 0; // RTO calc
-	//SteamNetworkingMicroseconds m_usec_nfb = 0; // Nofeedback Timer
-	//bool m_bSentPacketSinceNFB = false; // Set to false whenever we update nfb to detect sender idle periods
 
 	/// If >=0, then we can send a full packet right now.  We allow ourselves to "store up"
 	/// about 1 packet worth of "reserve".  In other words, if we have not sent any packets
@@ -232,23 +210,6 @@ struct SSNPSenderState
 	{
 		m_usecTokenBucketTime = usecNow;
 		m_flTokenBucket = k_flSendRateBurstOverageAllowance;
-	}
-
-	/// Accumulate "tokens" into our bucket base on the current calculated send rate
-	void TokenBucket_Accumulate( SteamNetworkingMicroseconds usecNow )
-	{
-		float flElapsed = ( usecNow - m_usecTokenBucketTime ) * 1e-6;
-		m_flTokenBucket += (float)m_n_x * flElapsed;
-		m_usecTokenBucketTime = usecNow;
-
-		// If we don't currently have any packets ready to send right now,
-		// then go ahead and limit the tokens.  If we do have packets ready
-		// to send right now, then we must assume that we would be trying to
-		// wakeup as soon as we are ready to send the next packet, and thus
-		// any excess tokens we accumulate are because the scheduler woke
-		// us up late, and we are not actually bursting
-		if ( TimeWhenWantToSendNextPacket() > usecNow )
-			TokenBucket_Limit();
 	}
 
 	/// Return timestamp when we will *want* to send the next packet.
@@ -364,50 +325,8 @@ struct SSNPSenderState
 	/// to send acks for.
 	int64 m_nMinPktWaitingOnAck = 0;
 
-	/// Time when this was updated
-	//SteamNetworkingMicroseconds m_usecWhenAdvancedMinPktWaitingOnAck = 0;
-
-	/* TFRC sender states */
-	enum ETFRCSenderStates {
-		TFRC_SSTATE_NO_SENT = 1,
-		TFRC_SSTATE_NO_FBACK,
-		TFRC_SSTATE_FBACK,
-	};
-	ETFRCSenderStates m_e_tx_state = TFRC_SSTATE_NO_SENT; // Sender state
-	SteamNetworkingMicroseconds m_usec_no_feedback_timer = 0; // No feedback timer
-	SteamNetworkingMicroseconds m_usec_ld = 0; // Time last doubled during slow start
-
-//	// Set when receiver determines we need to send a feedback packet
-//	/* TFRC feedback sender states */
-//	enum ETFRCSenderFeedbackStates {
-//		TFRC_SSTATE_FBACK_NONE = 0, //
-//		TFRC_SSTATE_FBACK_REQ = 1, // Set if we should send a feedback without data (parm change)
-//		TFRC_SSTATE_FBACK_PERODIC = 2, // When periodic feedback is set, we piggy pack on a data packet
-//	};
-//	ETFRCSenderFeedbackStates m_sendFeedbackState = TFRC_SSTATE_FBACK_NONE;
-
 	// Remove messages from m_unackedReliableMessages that have been fully acked.
 	void RemoveAckedReliableMessageFromUnackedList();
-
-	void SetNoFeedbackTimer( SteamNetworkingMicroseconds usecNow )
-	{
-		// FIXME
-		//if ( m_usec_rto == 0 )
-		//{
-		//	m_usec_nfb = usecNow + TFRC_INITIAL_TIMEOUT;
-		//}
-		//else
-		//{
-		//	// Calculate inter-packet-interval ("ipi")
-		//	SteamNetworkingMicroseconds ipi = k_nMillion * (int64)m_n_tx_s / (int64)m_n_x;
-		//
-		//	// Expect feedback within the RTO timeout, or 2 sent packets,
-		//	// whichever is greater
-		//	//
-		//	// Hm, this isn't what the RFC said to do.  I wonder where this logic came from.
-		//	m_usec_nfb = usecNow + Max( m_usec_rto, 2 * ipi );
-		//}
-	}
 };
 
 struct SSNPRecvUnreliableSegmentKey
@@ -433,11 +352,19 @@ struct SSNPRecvUnreliableSegmentData
 struct SSNPPacketGap
 {
 	int64 m_nEnd; // just after the last packet received
-	SteamNetworkingMicroseconds m_usecWhenReceivedPktBefore;
+	SteamNetworkingMicroseconds m_usecWhenReceivedPktBefore; // So we can send RTT data in our acks
+	SteamNetworkingMicroseconds m_usecWhenAckPrior; // We need to send an ack for everything with lower packet numbers than this gap by this time.  (Earlier is OK.)
+	SteamNetworkingMicroseconds m_usecWhenOKToNack; // Don't give up on the gap being filed before this time
 };
 
 struct SSNPReceiverState
 {
+	SSNPReceiverState();
+	~SSNPReceiverState() {
+		Shutdown();
+	}
+	void Shutdown();
+
 	/// Unreliable message segments that we have received.  When an unreliable message
 	/// needs to be fragmented, we store the pieces here.  NOTE: it might be more efficient
 	/// to use a simpler container, with worse O(), since this should ordinarily be
@@ -470,6 +397,14 @@ struct SSNPReceiverState
 	/// Since these must never overlap, we store them using begin as the
 	/// key and the end in the value.
 	///
+	/// The last item in the list is a sentinel with
+	/// begin and end set to INT64_MAX, and m_usecWhenAckPrior is
+	/// the time when we need to flush acks/backs for all packets,
+	/// including those received after the last gap (if any --
+	/// INT64_MAX means nothing scheduled).  Remember, our wire
+	/// protocol cannot report on packet N without also reporting
+	/// on all packets numbered < N.
+	///
 	/// !SPEED! We should probably use a small fixed-sized, sorted vector here,
 	/// since in most cases the list will be small, and the cost of dynamic memory
 	/// allocation will be way worse than O(n) insertion/removal.
@@ -481,43 +416,65 @@ struct SSNPReceiverState
 	/// Packet number when we received the value of m_nMinPktNumToSendAcks
 	int64 m_nPktNumUpdatedMinPktNumToSendAcks = 0;
 
-	/// Timeout for when we need to flush out acks, if no other opportunity
-	/// comes along (piggy on top of outbound data packet) to do this.
-	SteamNetworkingMicroseconds m_usecWhenFlushAck = INT64_MAX;
+	/// The next ack that needs to be sent.  The invariant
+	/// for the times are:
+	///
+	/// * Blocks with lower pakcet numbers: m_usecWhenAckPrior = INT64_MAX
+	/// * This block: m_usecWhenAckPrior < INT64_MAX, or we are the sentinel
+	/// * Blocks with higher packet numbers (if we are not the sentinel): m_usecWhenAckPrior >= previous m_usecWhenAckPrior
+	///
+	/// We might send acks before they are due, rather than
+	/// waiting until the last moment!  If we are going to
+	/// send a packet at all, we usually try to send at least
+	/// a few acks, and if there is room in the packet, as
+	/// many as will fit.  The one exception is that if
+	/// sending an ack would imply a NACK that we don't want to
+	/// send yet.  (Remember the restrictions on what we are able
+	/// to commununicate due to the tight RLE encoding of the wire
+	/// format.)  These delays are usually very short lived, and
+	/// only happen when there is packet loss, so they don't delay
+	/// acks very much.  The whole purpose of this rather involved
+	/// bookkeeping is to figure out which acks we *need* to send,
+	/// and which acks we cannot send yet, so we can make optimal
+	/// decisions.
+	std::map<int64,SSNPPacketGap>::iterator m_itPendingAck;
 
-	inline void MarkNeedToSendAck( SteamNetworkingMicroseconds usecNow )
+	/// Iterator into m_mapPacketGaps.  If != the sentinel,
+	/// we will avoid reporting on the dropped packets in this
+	/// gap (and all higher numbered packets), because we are
+	/// waiting in the hopes that they will arrive out of order.
+	std::map<int64,SSNPPacketGap>::iterator m_itPendingNack;
+
+	/// Queue a flush of ALL acks (and NACKs!) by the given time.
+	/// If anything is scheduled to happen earlier, that schedule
+	/// will still be honered.  We will ack up to that packet number,
+	/// and then we we may report higher numbered blocks, or we may
+	/// stop and wait to report more acks until later.
+	void QueueFlushAllAcks( SteamNetworkingMicroseconds usecWhen );
+
+	/// Return the time when we need to flush out acks, or INT64_MAX
+	/// if we don't have any acks pending right now.
+	inline SteamNetworkingMicroseconds TimeWhenFlushAcks() const
 	{
-		m_usecWhenFlushAck = std::min( m_usecWhenFlushAck, usecNow + k_usecMaxDataAckDelay );
+		// Paranoia
+		if ( m_mapPacketGaps.empty() )
+		{
+			AssertMsg( false, "TimeWhenFlushAcks - we're shut down!" );
+			return INT64_MAX;
+		}
+		return m_itPendingAck->second.m_usecWhenAckPrior;
 	}
+
+	/// Check invariants in debug.
+	#ifdef _DEBUG
+		void DebugCheckPackGapMap() const;
+	#else
+		inline void DebugCheckPackGapMap() const {}
+	#endif
 
 	// Stats.  FIXME - move to LinkStatsEndToEnd and track rate counters
 	int64 m_nMessagesRecvReliable = 0;
 	int64 m_nMessagesRecvUnreliable = 0;
-
-
-
-	enum ETFRCFeedbackType {
-		TFRC_FBACK_NONE = 0,
-		TFRC_FBACK_INITIAL,
-		TFRC_FBACK_PERIODIC,
-		TFRC_FBACK_PARAM_CHANGE
-	};
-
-	/* TFRC receiver states */
-	enum ETFRCReceiverStates {
-		TFRC_RSTATE_NO_DATA = 1,
-		TFRC_RSTATE_DATA,
-	};
-
-	ETFRCReceiverStates m_e_rx_state = TFRC_RSTATE_NO_DATA; // Receiver state
-	int m_n_x_recv = 0; // Receiver estimate of send rate (RFC 3448, sec. 4.3)
-	SteamNetworkingMicroseconds m_usec_tstamp_last_feedback = 0; // Time at which last feedback was sent
-	int m_n_rx_s = 0;	// Average packet size in bytes
-	SteamNetworkingMicroseconds m_usec_next_feedback = 0; // Time we should send next feedback,
-														  // its usually now + rtt, but can be set earlier 
-														  // if a param change happense.
-
-	uint32 m_li_i_mean = 0; // Current Average Loss Interval [RFC 3448, 5.4] scaled to 0-UINT_MAX
 };
 
 } // SteamNetworkingSocketsLib

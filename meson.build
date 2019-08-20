@@ -18,6 +18,7 @@ if target_os == 'windows'
 else
   flags_common += [
     '-fstack-protector-strong',
+    '-fstack-clash-protection',
   ]
 endif
 
@@ -30,23 +31,45 @@ flags_cxx = [
 warn_flags_common = [
   '-Wall',
   '-Wextra',
-  '-Wno-unknown-pragmas',
-  '-Wno-sign-compare',
+
+  # Explicitly disable noisy warnings
+  '-Wno-documentation',
   '-Wno-implicit-fallthrough',
-  '-Wno-unused-parameter',
-  '-Wno-unused-local-typedef',
+  '-Wno-padded',
+  '-Wno-sign-compare',
+  '-Wno-sign-conversion',
+  '-Wno-signed-enum-bitfield',
+  '-Wno-unknown-pragmas',
   '-Wno-unused-const-variable',
+  '-Wno-unused-local-typedef',
+  '-Wno-unused-parameter',
+  '-Wno-nested-anon-types',
 ]
+
+werror = get_option('Werror')
+if werror
+  warn_flags_common += [ '-Werror' ]
+endif
 
 warn_flags_c = [
   '-Wimplicit',
   '-Wstrict-prototypes',
+  '-Wno-missing-prototypes',
 ]
 
 warn_flags_cxx = [
-  '-Wno-reorder',
+  '-Wno-c++98-compat',
+  '-Wno-c++98-compat-pedantic',
+  '-Wno-exit-time-destructors',
+  '-Wno-global-constructors',
   '-Wno-non-virtual-dtor',
-  #'-Wweak-vtables',
+  '-Wno-old-style-cast',
+  '-Wno-reorder',
+
+  # These ones are prolific but don't really matter. Most are in generated
+  # protobuf code.
+  '-Wno-zero-as-null-pointer-constant',
+  '-Wno-missing-variable-declarations',
 ]
 
 c_compiler = meson.get_compiler('c')
@@ -70,5 +93,30 @@ foreach arg : flags_common + warn_flags_common + flags_cxx + warn_flags_cxx
 endforeach
 add_project_arguments(cxx_flags, language: 'cpp')
 
+# Preprocessor defines for platform and compiler
+cpp_flags = []
+if target_os == 'linux'
+  cpp_flags += ['-DPOSIX', '-DLINUX']
+elif target_os == 'darwin'
+  cpp_flags += ['-DPOSIX', '-DOSX']
+elif target_os == 'windows'
+  cpp_flags += ['-D_WIN32', '-DWIN32', '-D__STDC_FORMAT_MACROS=1', '-D__USE_MINGW_ANSI_STDIO=0']
+else
+  error('Could not identify your target operating system')
+endif
+
+# I really do wonder why we need to set a #define to identify the compiler.
+# Doesn't the compiler identify itself?  We should try to get rid of this.
+target_compiler = c_compiler.get_id()
+if target_compiler == 'gcc' or target_compiler == 'clang'
+  cpp_flags += ['-DGNUC', '-DGNU_COMPILER']
+endif
+
+add_project_arguments(cpp_flags, language: 'c')
+add_project_arguments(cpp_flags, language: 'cpp')
+
+dep_threads = dependency('threads')
+
 subdir('src')
 subdir('tests')
+subdir('examples')
